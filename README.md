@@ -1,4 +1,5 @@
 # HiveMind
+![HiveMind Logo](assets/hivemind_logo.jpg)
 
 HiveMind is a powerful reverse shell multi-handler designed for managing multiple active sessions efficiently. It supports Windows and Linux payloads, automatic session aliasing, and interactive shell handling with TTY upgrades.
 
