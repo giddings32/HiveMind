@@ -14,14 +14,6 @@ HiveMind is a powerful reverse shell multi-handler designed for managing multipl
 
 ## Installation
 
-### Prerequisites
-
-Ensure you have Python installed along with the necessary dependencies:
-
-```bash
-pip install termcolor netifaces
-```
-
 ### Cloning the Repository
 
 ```bash
