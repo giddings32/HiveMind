@@ -182,33 +182,11 @@ def generate_payload(payload_type, lhost, encode=False):
     
     return payload
 
-# --- Handshake & Reconnection Handling ---
-def perform_handshake(conn):
-    """
-    Simple handshake: the server sends a handshake prompt.
-    If the client replies with "session:<id>", we treat it as a reconnection.
-    Otherwise, or on timeout, it's a new session.
-    """
-    try:
-        conn.settimeout(5)
-        conn.send(b"HIVEMIND_HANDSHAKE\n")  # Prompt client to send handshake token
-        data = conn.recv(1024).strip()
-        conn.settimeout(None)
-        if data and data.lower().startswith(b"session:"):
-            return data.decode().strip()
-        else:
-            return "new"
-    except socket.timeout:
-        conn.settimeout(None)
-        return "new"
-    except Exception as e:
-        safe_print(colored(f"[-] Handshake error: {e}", "red"), flush=True)
-        return "new"
-
 # --- Networking Functions ---
 def start_listener(port):
     """
     Listens on the given port and spawns a new thread for each incoming connection.
+    Handshake functionality has been removed so that each connection is treated as a new session.
     """
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -224,30 +202,11 @@ def start_listener(port):
     while True:
         try:
             conn, addr = server.accept()
-            # Perform handshake to check for reconnection attempts
-            handshake_result = perform_handshake(conn)
-            if handshake_result != "new":
-                # Expecting format "session:<id>"
-                try:
-                    token = handshake_result.split(":", 1)[1]
-                    recon_sid = int(token)
-                    with lock:
-                        if recon_sid in sessions:
-                            sessions[recon_sid].conn.close()  # Close old connection
-                            sessions[recon_sid].conn = conn
-                            sessions[recon_sid].addr = addr
-                            sessions[recon_sid].last_heartbeat = time.time()
-                            safe_print(colored(f"[+] Session {recon_sid} reconnected from {addr}", "green"), flush=True)
-                            continue  # Do not create a new session
-                except Exception as e:
-                    safe_print(colored(f"[-] Invalid handshake token. Establishing as new session. ({e})", "red"), flush=True)
-            # Otherwise, establish a new session
             with lock:
                 session_obj = Session(global_session_counter, conn, addr)
                 sessions[global_session_counter] = session_obj
                 safe_print(colored(f"[+] Session {global_session_counter} established from {addr}", "green"), flush=True)
                 global_session_counter += 1
-            # Launch a thread for potential background handling for this session.
             threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
         except Exception as e:
             safe_print(colored(f"[-] Error accepting connection: {e}", "red"), flush=True)
@@ -398,7 +357,7 @@ def list_sessions():
     safe_print("", flush=True)
 
 def cleanup_sessions():
-    """Automatically removes any sessions that are no longer active or have timed out."""
+    """Manually removes any sessions that are no longer active or have timed out."""
     removed = 0
     now = time.time()
     with lock:
@@ -412,12 +371,7 @@ def cleanup_sessions():
                 del sessions[sid]
                 removed += 1
     if removed:
-        safe_print(colored(f"[*] Auto-cleanup: Removed {removed} dead session(s).", "yellow"), flush=True)
-
-def auto_cleanup_thread():
-    while True:
-        time.sleep(30)
-        cleanup_sessions()
+        safe_print(colored(f"[*] Cleanup: Removed {removed} dead session(s).", "yellow"), flush=True)
 
 # --- Enhanced Autocompletion ---
 def completer(text, state):
@@ -580,6 +534,4 @@ if __name__ == "__main__":
     listener_thread = threading.Thread(target=lambda: start_listener(DEFAULT_PORT), daemon=True)
     listener_thread.start()
     listener_ready.wait()  # Wait until the listener has printed its startup message.
-    cleanup_thread = threading.Thread(target=auto_cleanup_thread, daemon=True)
-    cleanup_thread.start()
     command_line()
