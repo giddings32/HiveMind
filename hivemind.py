@@ -10,6 +10,7 @@ import base64
 import time
 import readline  # For tab autocomplete and history
 from termcolor import colored
+import pyperclip  # For copying output to clipboard
 
 # Global default port for all reverse shells
 DEFAULT_PORT = 4444
@@ -29,9 +30,9 @@ PAYLOAD_TYPES = [
     "linux/reverse_tcp/ruby"
 ]
 
-# Command list without the dashboard.
+# Command list now includes the new "clear" command.
 COMMANDS = [
-    'alias', 'cleanup', 'cmd', 'exit', 'help',
+    'alias', 'cleanup', 'cmd', 'clear', 'exit', 'help',
     'kill', 'session', 'sessions', 'set payload', 'show payloads', 'upgrade'
 ]
 
@@ -81,6 +82,7 @@ def show_help():
     safe_print(colored("  alias <id|alias> <new_alias>         - Set an alias for a session", "green"), flush=True)
     safe_print(colored("  cleanup                              - Manually clean up dead sessions", "green"), flush=True)
     safe_print(colored("  cmd <command>                        - Execute a local shell command", "green"), flush=True)
+    safe_print(colored("  clear                                - Clear the screen and reprint the header", "green"), flush=True)
     safe_print(colored("  exit                                 - Exit HiveMind", "green"), flush=True)
     safe_print(colored("  help                                 - Show this help menu", "green"), flush=True)
     safe_print(colored("  kill <id|alias>                      - Kill a session", "green"), flush=True)
@@ -440,6 +442,10 @@ def command_line():
         if lower_cmd == "sessions":
             list_sessions()
 
+        elif lower_cmd == "clear":
+            os.system('cls' if os.name == 'nt' else 'clear')
+            banner()
+
         elif lower_cmd.startswith("session "):
             if len(parts) < 2:
                 safe_print(colored("[-] Usage: session <id|alias>", "red"), flush=True)
@@ -501,6 +507,11 @@ def command_line():
             generated = generate_payload(payload_type, lhost, encode)
             safe_print(colored("\n[+] Generated Payload:", "yellow"), flush=True)
             safe_print(generated + "\n", flush=True)
+            try:
+                pyperclip.copy(generated)
+                safe_print(colored("[*] Payload copied to clipboard.", "green"), flush=True)
+            except Exception as e:
+                safe_print(colored(f"[-] Could not copy payload to clipboard: {e}", "red"), flush=True)
 
         elif lower_cmd == "show payloads":
             list_payloads()
