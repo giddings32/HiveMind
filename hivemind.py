@@ -601,7 +601,7 @@ def probe_linux_upgrade_tools(session):
         safe_print(colored(f"[-] Failed to probe upgrade tools: {e}", "red"), flush=True)
         return {}
 
-    output = capture_session_output(session, timeout=1.2, stop_marker=end_marker)
+    output = capture_session_output(session, timeout=1.2)
     body = extract_marker_body(output, start_marker, end_marker)
     tools = {}
 
